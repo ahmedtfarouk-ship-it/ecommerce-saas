@@ -2,7 +2,6 @@
 
 import { 
   GoogleSheetsResponse, 
-  GoogleSheetsRow,
   SyncResult,
   ColumnMapping,
   DEFAULT_COLUMN_MAPPING,

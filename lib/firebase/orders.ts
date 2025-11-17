@@ -1,327 +1,192 @@
-// lib/firebase/orderService.ts
-import {
-  collection,
-  doc,
-  getDocs,
-  getDoc,
-  addDoc,
-  updateDoc,
-  deleteDoc,
-  query,
-  where,
-  orderBy,
-  limit,
+// lib/firebase/orders.ts
+
+import { 
+  collection, 
+  getDocs, 
+  deleteDoc, 
+  doc, 
+  query, 
+  orderBy, 
+  limit, 
   startAfter,
   Timestamp,
-  QueryConstraint,
+  QueryDocumentSnapshot,
+  writeBatch,
+  addDoc
 } from 'firebase/firestore';
 import { db } from './config';
-import type {
-  Order,
-  CreateOrderInput,
-  UpdateOrderInput,
-  OrderFilters,
-  OrderStats,
-} from '@/lib/types/order';
+import { parseAddress } from '../utils/addressParser';
+import { Order, OrderStatus, OrderUploadData } from '@/types';
 
-const ORDERS_COLLECTION = 'orders';
-
-/**
- * Get collection name for tenant
- */
-function getOrdersCollection(tenantId: string) {
-  return `orders_${tenantId}`;
-}
-
-/**
- * Create a new order
- */
-export async function createOrder(
-  input: CreateOrderInput,
-  tenantId: string
-): Promise<string> {
-  const ordersRef = collection(db, getOrdersCollection(tenantId));
+export function generateReferenceNumber(phone: string, existingOrders: number = 0): string {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, '0');
+  const phoneDigits = phone.replace(/\D/g, '').slice(-4);
+  const sequence = String(existingOrders + 1).padStart(4, '0');
   
-  const totalAmount = input.price + input.shippingCost - input.discount;
+  return `ORD-${year}${month}-${phoneDigits}${sequence}`;
+}
+
+function cleanOrderData(data: OrderUploadData, tenantId: string, userId: string): Omit<Order, 'id'> {
+  const addressAnalysis = parseAddress(data.address);
   
-  const orderData = {
-    ...input,
-    totalAmount,
-    isPaid: false,
-    createdAt: Timestamp.now(),
-    updatedAt: Timestamp.now(),
-  };
-
-  const docRef = await addDoc(ordersRef, orderData);
-  return docRef.id;
-}
-
-/**
- * Get all orders with filters
- */
-export async function getOrders(
-  tenantId: string,
-  filters?: OrderFilters,
-  pageSize: number = 50,
-  lastDoc?: any
-): Promise<Order[]> {
-  const ordersRef = collection(db, getOrdersCollection(tenantId));
-  const constraints: QueryConstraint[] = [];
-
-  // Apply filters
-  if (filters?.status && filters.status.length > 0) {
-    constraints.push(where('status', 'in', filters.status));
+  let price = 0;
+  if (typeof data.price === 'string') {
+    price = parseFloat(data.price.replace(/[^\d.-]/g, '')) || 0;
+  } else {
+    price = Number(data.price) || 0;
   }
 
-  if (filters?.governorate) {
-    constraints.push(where('governorate', '==', filters.governorate));
+  let status: OrderStatus = 'pending';
+  if (data.status) {
+    const statusLower = data.status.toLowerCase();
+    if (statusLower.includes('confirm') || statusLower.includes('تأكيد')) {
+      status = 'confirmed';
+    } else if (statusLower.includes('ship') || statusLower.includes('شحن')) {
+      status = 'shipped';
+    } else if (statusLower.includes('deliver') || statusLower.includes('تسليم')) {
+      status = 'delivered';
+    } else if (statusLower.includes('cancel') || statusLower.includes('ملغ')) {
+      status = 'cancelled';
+    } else if (statusLower.includes('return') || statusLower.includes('مرتجع')) {
+      status = 'returned';
+    }
   }
 
-  if (filters?.city) {
-    constraints.push(where('city', '==', filters.city));
-  }
-
-  if (filters?.source) {
-    constraints.push(where('source', '==', filters.source));
-  }
-
-  if (filters?.isPaid !== undefined) {
-    constraints.push(where('isPaid', '==', filters.isPaid));
-  }
-
-  if (filters?.shippingCompany) {
-    constraints.push(where('shippingCompany', '==', filters.shippingCompany));
-  }
-
-  // Date range
-  if (filters?.dateFrom) {
-    constraints.push(where('createdAt', '>=', Timestamp.fromDate(filters.dateFrom)));
-  }
-
-  if (filters?.dateTo) {
-    constraints.push(where('createdAt', '<=', Timestamp.fromDate(filters.dateTo)));
-  }
-
-  // Order by and pagination
-  constraints.push(orderBy('createdAt', 'desc'));
-  constraints.push(limit(pageSize));
-
-  if (lastDoc) {
-    constraints.push(startAfter(lastDoc));
-  }
-
-  const q = query(ordersRef, ...constraints);
-  const snapshot = await getDocs(q);
-
-  return snapshot.docs.map(doc => ({
-    id: doc.id,
-    ...doc.data(),
-    createdAt: doc.data().createdAt?.toDate(),
-    updatedAt: doc.data().updatedAt?.toDate(),
-    confirmedAt: doc.data().confirmedAt?.toDate(),
-    shippedAt: doc.data().shippedAt?.toDate(),
-    deliveredAt: doc.data().deliveredAt?.toDate(),
-    returnedAt: doc.data().returnedAt?.toDate(),
-    paidAt: doc.data().paidAt?.toDate(),
-  })) as Order[];
-}
-
-/**
- * Get single order by ID
- */
-export async function getOrderById(
-  orderId: string,
-  tenantId: string
-): Promise<Order | null> {
-  const orderRef = doc(db, getOrdersCollection(tenantId), orderId);
-  const snapshot = await getDoc(orderRef);
-
-  if (!snapshot.exists()) {
-    return null;
+  let cleanPhone = String(data.phone || '')
+    .replace(/[\s\-\(\)]/g, '')
+    .replace(/\D/g, '');
+  
+  if (cleanPhone && !cleanPhone.startsWith('0') && cleanPhone.length === 10) {
+    cleanPhone = '0' + cleanPhone;
   }
 
   return {
-    id: snapshot.id,
-    ...snapshot.data(),
-    createdAt: snapshot.data().createdAt?.toDate(),
-    updatedAt: snapshot.data().updatedAt?.toDate(),
-    confirmedAt: snapshot.data().confirmedAt?.toDate(),
-    shippedAt: snapshot.data().shippedAt?.toDate(),
-    deliveredAt: snapshot.data().deliveredAt?.toDate(),
-    returnedAt: snapshot.data().returnedAt?.toDate(),
-    paidAt: snapshot.data().paidAt?.toDate(),
-  } as Order;
+    referenceNumber: '',
+    customerName: String(data.customerName || '').trim(),
+    phone: cleanPhone,
+    address: String(data.address || '').trim(),
+    product: String(data.product || '').trim(),
+    price,
+    status,
+    shippingCompany: data.shippingCompany?.trim() || undefined,
+    trackingNumber: data.trackingNumber?.trim() || undefined,
+    governorate: addressAnalysis.governorate || undefined,
+    city: addressAnalysis.city || undefined,
+    district: addressAnalysis.district,
+    notes: data.notes?.trim() || undefined,
+    tenantId,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+    createdBy: userId
+  };
 }
 
-/**
- * Update order
- */
-export async function updateOrder(
-  input: UpdateOrderInput,
-  tenantId: string
-): Promise<void> {
-  const orderRef = doc(db, getOrdersCollection(tenantId), input.id);
+export async function uploadOrders(
+  ordersData: OrderUploadData[], 
+  tenantId: string,
+  userId: string
+): Promise<{ success: number; failed: number; errors: string[] }> {
+  const collectionName = `orders_${tenantId}`;
   
-  const updateData: any = {
-    ...input,
-    updatedAt: Timestamp.now(),
-  };
+  let success = 0;
+  let failed = 0;
+  const errors: string[] = [];
 
-  // Update status timestamps
-  if (input.status === 'confirmed' && !updateData.confirmedAt) {
-    updateData.confirmedAt = Timestamp.now();
-  }
-  if (input.status === 'shipped' && !updateData.shippedAt) {
-    updateData.shippedAt = Timestamp.now();
-  }
-  if (input.status === 'delivered' && !updateData.deliveredAt) {
-    updateData.deliveredAt = Timestamp.now();
-  }
-  if (input.status === 'returned' && !updateData.returnedAt) {
-    updateData.returnedAt = Timestamp.now();
-  }
+  const existingOrdersSnapshot = await getDocs(collection(db, collectionName));
+  let orderCount = existingOrdersSnapshot.size;
 
-  delete updateData.id;
-  await updateDoc(orderRef, updateData);
-}
-
-/**
- * Delete order
- */
-export async function deleteOrder(
-  orderId: string,
-  tenantId: string
-): Promise<void> {
-  const orderRef = doc(db, getOrdersCollection(tenantId), orderId);
-  await deleteDoc(orderRef);
-}
-
-/**
- * Bulk delete orders
- */
-export async function bulkDeleteOrders(
-  orderIds: string[],
-  tenantId: string
-): Promise<void> {
-  const promises = orderIds.map(id => deleteOrder(id, tenantId));
-  await Promise.all(promises);
-}
-
-/**
- * Get order statistics
- */
-export async function getOrderStats(tenantId: string): Promise<OrderStats> {
-  const orders = await getOrders(tenantId, {}, 1000);
-
-  const stats: OrderStats = {
-    total: orders.length,
-    pending: 0,
-    confirmed: 0,
-    shipped: 0,
-    delivered: 0,
-    returned: 0,
-    cancelled: 0,
-    totalRevenue: 0,
-    averageOrderValue: 0,
-    deliveryRate: 0,
-    returnRate: 0,
-  };
-
-  orders.forEach(order => {
-    // Count by status
-    stats[order.status]++;
-
-    // Calculate revenue (only delivered orders)
-    if (order.status === 'delivered') {
-      stats.totalRevenue += order.totalAmount;
-    }
-  });
-
-  // Calculate rates
-  stats.averageOrderValue = stats.total > 0 ? stats.totalRevenue / stats.delivered : 0;
-  stats.deliveryRate = stats.total > 0 ? (stats.delivered / stats.total) * 100 : 0;
-  stats.returnRate = stats.total > 0 ? (stats.returned / stats.total) * 100 : 0;
-
-  return stats;
-}
-
-/**
- * Check if order exists by EasyOrder ID (for duplicate detection)
- */
-export async function checkDuplicateOrder(
-  easyOrderId: string,
-  tenantId: string
-): Promise<boolean> {
-  const ordersRef = collection(db, getOrdersCollection(tenantId));
-  const q = query(ordersRef, where('easyOrderId', '==', easyOrderId), limit(1));
-  const snapshot = await getDocs(q);
-  return !snapshot.empty;
-}
-
-/**
- * Bulk create orders (for Google Sheets sync)
- */
-export async function bulkCreateOrders(
-  orders: CreateOrderInput[],
-  tenantId: string
-): Promise<{ created: number; duplicates: number; errors: number }> {
-  let created = 0;
-  let duplicates = 0;
-  let errors = 0;
-
-  for (const order of orders) {
+  for (let i = 0; i < ordersData.length; i++) {
     try {
-      // Check for duplicates if easyOrderId exists
-      if (order.easyOrderId) {
-        const isDuplicate = await checkDuplicateOrder(order.easyOrderId, tenantId);
-        if (isDuplicate) {
-          duplicates++;
-          continue;
-        }
+      const orderData = ordersData[i];
+      
+      if (!orderData.customerName || !orderData.phone || !orderData.address) {
+        errors.push(`الصف ${i + 2}: بيانات ناقصة`);
+        failed++;
+        continue;
       }
 
-      await createOrder(order, tenantId);
-      created++;
+      const cleanedOrder = cleanOrderData(orderData, tenantId, userId);
+      
+      cleanedOrder.referenceNumber = generateReferenceNumber(
+        cleanedOrder.phone, 
+        orderCount + success
+      );
+
+      const orderToSave: any = {
+        ...cleanedOrder,
+        createdAt: Timestamp.fromDate(cleanedOrder.createdAt),
+        updatedAt: Timestamp.fromDate(cleanedOrder.updatedAt)
+      };
+
+      Object.keys(orderToSave).forEach(key => {
+        if (orderToSave[key] === undefined) {
+          delete orderToSave[key];
+        }
+      });
+
+      await addDoc(collection(db, collectionName), orderToSave);
+
+      success++;
+
     } catch (error) {
-      console.error('Error creating order:', error);
-      errors++;
+      failed++;
+      const errorMsg = error instanceof Error ? error.message : 'خطأ غير معروف';
+      errors.push(`الصف ${i + 2}: ${errorMsg}`);
     }
   }
 
-  return { created, duplicates, errors };
+  return { success, failed, errors };
 }
 
-/**
- * Search orders by customer name or phone
- */
-export async function searchOrders(
-  searchTerm: string,
-  tenantId: string
-): Promise<Order[]> {
-  const ordersRef = collection(db, getOrdersCollection(tenantId));
+export async function fetchOrders(
+  tenantId: string,
+  pageSize: number = 50,
+  lastDoc?: QueryDocumentSnapshot
+): Promise<{ orders: Order[]; lastVisible: QueryDocumentSnapshot | null }> {
+  const collectionName = `orders_${tenantId}`;
   
-  // Search by phone (exact match)
-  const phoneQuery = query(
-    ordersRef,
-    where('phone', '==', searchTerm),
+  let q = query(
+    collection(db, collectionName),
     orderBy('createdAt', 'desc'),
-    limit(50)
+    limit(pageSize)
   );
 
-  const phoneSnapshot = await getDocs(phoneQuery);
-  
-  if (!phoneSnapshot.empty) {
-    return phoneSnapshot.docs.map(doc => ({
-      id: doc.id,
-      ...doc.data(),
-      createdAt: doc.data().createdAt?.toDate(),
-      updatedAt: doc.data().updatedAt?.toDate(),
-    })) as Order[];
+  if (lastDoc) {
+    q = query(
+      collection(db, collectionName),
+      orderBy('createdAt', 'desc'),
+      startAfter(lastDoc),
+      limit(pageSize)
+    );
   }
 
-  // If no phone match, get all and filter by name (client-side)
-  const allOrders = await getOrders(tenantId, {}, 100);
-  return allOrders.filter(order =>
-    order.customerName.toLowerCase().includes(searchTerm.toLowerCase())
-  );
+  const snapshot = await getDocs(q);
+  
+  const orders: Order[] = snapshot.docs.map(doc => {
+    const data = doc.data();
+    return {
+      id: doc.id,
+      ...data,
+      createdAt: data.createdAt?.toDate() || new Date(),
+      updatedAt: data.updatedAt?.toDate() || new Date()
+    } as Order;
+  });
+
+  const lastVisible = snapshot.docs[snapshot.docs.length - 1] || null;
+
+  return { orders, lastVisible };
+}
+
+export async function deleteOrders(orderIds: string[], tenantId: string): Promise<void> {
+  const collectionName = `orders_${tenantId}`;
+  const batch = writeBatch(db);
+
+  orderIds.forEach(orderId => {
+    const orderDoc = doc(db, collectionName, orderId);
+    batch.delete(orderDoc);
+  });
+
+  await batch.commit();
 }
